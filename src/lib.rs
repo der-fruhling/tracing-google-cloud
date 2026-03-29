@@ -111,6 +111,25 @@ use {
     tracing_opentelemetry::OtelData
 };
 
+/// Allows using any severity value supported by Cloud Logging.
+///
+/// Use like:
+/// ```
+/// use tracing_google_cloud::Severity;
+///
+/// tracing::debug!(severity = %Severity::Debug, "message");
+/// tracing::info!(severity = %Severity::Info, "information");
+/// tracing::info!(severity = %Severity::Notice, "hmm notice");
+/// tracing::warn!(severity = %Severity::Warning, "a scary warning!");
+/// tracing::error!(severity = %Severity::Error, "something is wrong");
+///
+/// // these are only available as Severity enums:
+/// tracing::error!(severity = %Severity::Critical, "critical error!");
+/// tracing::error!(severity = %Severity::Alert, "oh no!");
+/// tracing::error!(severity = %Severity::Emergency, "this service is on fire now");
+/// ```
+///
+/// The tracing level is ignored by this crate when using the severity field.
 #[derive(Serialize, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Severity {
@@ -141,6 +160,13 @@ impl Display for Severity {
     }
 }
 
+/// A severity value was not one of the allowed enumerations.
+///
+/// If you're getting this error, you're probably not using the values
+/// contained in [Severity]. See those docs for an example.
+///
+/// If you are doing this correctly and this is still failing, it's
+/// probably a bug.
 #[derive(Debug)]
 pub struct InvalidSeverity(Box<str>);
 
@@ -715,6 +741,10 @@ impl Operation {
     }
 }
 
+/// This trait extends [tracing::Span] with additional functionality provided
+/// by this crate.
+///
+/// You should not implement this trait yourself, but I also cannot stop you.
 pub trait SpanExt {
     /// Retrieves an [Operation] associated with this [Span][tracing::Span].
     /// If one does not already exist, it will be created automatically.
@@ -819,6 +849,10 @@ impl<ProjectId: ProjectIdTrait, W: std::io::Write> LayerBuilder<ProjectId, W> {
     }
 }
 
+/// The main entrypoint for this crate. This function allows creating a [Layer]
+/// from scratch.
+///
+/// See the [docs on the crate itself][crate] for examples.
 pub fn builder() -> LayerBuilder {
     LayerBuilder {
         project_id: (),
