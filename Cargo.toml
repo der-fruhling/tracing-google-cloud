@@ -2,6 +2,22 @@
 name = "tracing-google-cloud"
 version = "0.1.0"
 edition = "2024"
+license = "BSD-3"
+repository = "https://github.com/der-fruhling/tracing-google-cloud"
+readme = "README.md"
+
+description = "A tracing-subscriber layer that outputs Google Cloud structured logs"
+
+categories = [
+    "development-tools::debugging",
+]
+
+keywords = [
+    "google-cloud",
+    "gcp",
+    "tracing",
+    "logging"
+]
 
 [dependencies]
 tracing = "0.1.44"
