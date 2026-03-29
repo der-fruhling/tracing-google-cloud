@@ -68,11 +68,10 @@
 //! use tracing_google_cloud::{OperationInfo, SpanExt};
 //!
 //! let span = tracing::info_span!("long_operation");
-//! let operation = span.operation();
-//! operation.init(OperationInfo::new(
+//! let operation = span.start_operation(
 //!     "unique-id",
 //!     Some("github.com/der-fruhling/tracing-google-cloud")
-//! ));
+//! );
 //!
 //! span.in_scope(|| {
 //!     // First log entry with an operation automatically has the "first" field set
@@ -724,6 +723,28 @@ pub trait SpanExt {
     /// e.g. in a development environment. In this case, the returned
     /// [Operation] will not perform any actions.
     fn operation(&'_ self) -> Operation;
+
+    /// A simple wrapper over [Operation::init] to make creating them a bit
+    /// nicer.
+    ///
+    /// ```
+    /// # use tracing_google_cloud::SpanExt;
+    /// # let span = tracing::info_span!("span");
+    /// let op = span.start_operation("id", Some("provider"));
+    /// ```
+    ///
+    /// The above is equivalent to:
+    /// ```
+    /// # use tracing_google_cloud::{SpanExt, OperationInfo};
+    /// # let span = tracing::info_span!("span");
+    /// let op = span.operation();
+    /// op.init(OperationInfo::new("id", Some("provider")));
+    /// ```
+    fn start_operation(&'_ self, id: impl AsRef<str>, producer: Option<impl AsRef<str>>) -> Operation {
+        let op = self.operation();
+        op.init(OperationInfo::new(id, producer));
+        op
+    }
 }
 
 impl SpanExt for tracing::Span {
