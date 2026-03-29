@@ -36,10 +36,7 @@ fn main() {
     let span = tracing::info_span!("test", test = 1);
 
     let operation = span.operation();
-    operation.update(OperationInfo {
-        id: Some("operation".into()),
-        producer: Some("amphoreus.info".into())
-    });
+    operation.init(OperationInfo::new("operation", Some("test")));
 
     span.in_scope(|| {
         tracing::info!("Hello world again!");

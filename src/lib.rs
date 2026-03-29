@@ -1,26 +1,120 @@
-use std::any::{Any, TypeId};
+//! This is a tracing-subcriber [Layer][tracing_subscriber::Layer] that
+//! implements Google Cloud's [Structured Logging] format.
+//!
+//! Features:
+//! - [OpenTelemetry] Trace integration (with `opentelemetry` feature flag)
+//! - Support for HTTP requests via log entry fields
+//! - Support for populating operation structures into log entries from
+//!   the parent [Span][tracing::Span]\(s).
+//!
+//! ```
+//! # const PROJECT_ID: &str = "my-project";
+//! # use tracing_subscriber::layer::SubscriberExt;
+//! # use tracing_subscriber::util::SubscriberInitExt;
+//! tracing_subscriber::registry()
+//!     .with(tracing_opentelemetry::layer())
+//!     .with(tracing_google_cloud::builder()
+//!         .with_project_id(PROJECT_ID) // required with opentelemetry feature
+//!         .with_writer(std::io::stdout())
+//!         .build())
+//!     .init();
+//! ```
+//!
+//! ## HTTP request fields
+//! ```
+//! # const PROJECT_ID: &str = "my-project";
+//! # use tracing_subscriber::layer::SubscriberExt;
+//! # use tracing_subscriber::util::SubscriberInitExt;
+//! # tracing_subscriber::registry()
+//! #     .with(tracing_opentelemetry::layer())
+//! #     .with(tracing_google_cloud::builder()
+//! #         .with_project_id(PROJECT_ID) // required with opentelemetry feature
+//! #         .with_writer(std::io::stdout())
+//! #         .build())
+//! #     .init();
+//! tracing::info!(
+//!     http.request_method = "POST",
+//!     http.request_url = "/",
+//!     http.request_size = 420,
+//!     http.status = 200,
+//!     http.response_size = 1024,
+//!     http.user_agent = "Fire fox",
+//!     http.remote_ip = "127.0.0.1",
+//!     http.server_ip = "127.0.0.2",
+//!     http.referer = "127.0.0.2",
+//!     http.latency_ns = 32000000,
+//!     http.cache_lookup = false,
+//!     http.cache_hit = false,
+//!     http.cache_validated_with_origin_server = false,
+//!     http.cache_fill_bytes = 200,
+//!     http.protocol = "HTTP/4",
+//! )
+//! ```
+//!
+//! ## Using operations
+//! See [SpanExt::operation] and [Operation].
+//!
+//! ```
+//! # const PROJECT_ID: &str = "my-project";
+//! # use tracing_subscriber::layer::SubscriberExt;
+//! # use tracing_subscriber::util::SubscriberInitExt;
+//! # tracing_subscriber::registry()
+//! #     .with(tracing_opentelemetry::layer())
+//! #     .with(tracing_google_cloud::builder()
+//! #         .with_project_id(PROJECT_ID) // required with opentelemetry feature
+//! #         .with_writer(std::io::stdout())
+//! #         .build())
+//! #     .init();
+//! use tracing_google_cloud::{OperationInfo, SpanExt};
+//!
+//! let span = tracing::info_span!("long_operation");
+//! let operation = span.operation();
+//! operation.init(OperationInfo::new(
+//!     "unique-id",
+//!     Some("github.com/der-fruhling/tracing-google-cloud")
+//! ));
+//!
+//! span.in_scope(|| {
+//!     // First log entry with an operation automatically has the "first" field set
+//!     tracing::info!("First log");
+//!
+//!     tracing::info!("Something in the middle");
+//!
+//!     // Call Operation::end() to cause the next log entry to have "last" set.
+//!     // You can also call this before the first entry if you wish.
+//!     operation.end();
+//!     tracing::info!("End of the operation");
+//! })
+//! ```
+//!
+//! [OpenTelemetry]: https://docs.rs/tracing-opentelemetry
+//! [Structured Logging]: https://docs.cloud.google.com/logging/docs/structured-logging#structured_logging_special_fields
+
+use base64::Engine;
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize, Serializer};
+use std::any::TypeId;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
-use std::rc::Rc;
 use std::str::FromStr;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock};
-use base64::Engine;
-use chrono::{DateTime, Duration, Utc};
-use opentelemetry::TraceId;
-use serde::{Serialize, Serializer};
-use serde::ser::Error;
-use tracing::{Event, Id, Level, Metadata, Subscriber};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use tracing::field::Field;
 use tracing::span::{Attributes, Record};
-use tracing_opentelemetry::OtelData;
-use tracing_subscriber::{field, Layer};
+use tracing::{Event, Id, Level, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::{field, Layer as TracingLayer};
+
+#[cfg(feature = "opentelemetry")]
+use {
+    opentelemetry::TraceId,
+    tracing_opentelemetry::OtelData
+};
 
 #[derive(Serialize, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum GcpSeverity {
+pub enum Severity {
     #[default] Default,
     Debug,
     Info,
@@ -32,18 +126,18 @@ pub enum GcpSeverity {
     Emergency,
 }
 
-impl Display for GcpSeverity {
+impl Display for Severity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            GcpSeverity::Default => "DEFAULT",
-            GcpSeverity::Debug => "DEBUG",
-            GcpSeverity::Info => "INFO",
-            GcpSeverity::Notice => "NOTICE",
-            GcpSeverity::Warning => "WARNING",
-            GcpSeverity::Error => "ERROR",
-            GcpSeverity::Critical => "CRITICAL",
-            GcpSeverity::Alert => "ALERT",
-            GcpSeverity::Emergency => "EMERGENCY",
+            Severity::Default => "DEFAULT",
+            Severity::Debug => "DEBUG",
+            Severity::Info => "INFO",
+            Severity::Notice => "NOTICE",
+            Severity::Warning => "WARNING",
+            Severity::Error => "ERROR",
+            Severity::Critical => "CRITICAL",
+            Severity::Alert => "ALERT",
+            Severity::Emergency => "EMERGENCY",
         })
     }
 }
@@ -59,20 +153,20 @@ impl Display for InvalidSeverity {
 
 impl std::error::Error for InvalidSeverity {}
 
-impl FromStr for GcpSeverity {
+impl FromStr for Severity {
     type Err = InvalidSeverity;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "DEFAULT" => Ok(GcpSeverity::Default),
-            "DEBUG" => Ok(GcpSeverity::Debug),
-            "INFO" => Ok(GcpSeverity::Info),
-            "NOTICE" => Ok(GcpSeverity::Notice),
-            "WARNING" => Ok(GcpSeverity::Warning),
-            "ERROR" => Ok(GcpSeverity::Error),
-            "CRITICAL" => Ok(GcpSeverity::Critical),
-            "ALERT" => Ok(GcpSeverity::Alert),
-            "EMERGENCY" => Ok(GcpSeverity::Emergency),
+            "DEFAULT" => Ok(Severity::Default),
+            "DEBUG" => Ok(Severity::Debug),
+            "INFO" => Ok(Severity::Info),
+            "NOTICE" => Ok(Severity::Notice),
+            "WARNING" => Ok(Severity::Warning),
+            "ERROR" => Ok(Severity::Error),
+            "CRITICAL" => Ok(Severity::Critical),
+            "ALERT" => Ok(Severity::Alert),
+            "EMERGENCY" => Ok(Severity::Emergency),
             other => Err(InvalidSeverity(other.into())),
         }
     }
@@ -93,9 +187,9 @@ struct SpanExposition {
 
 #[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct GcpStructuredLog<'a> {
+struct LogEntry<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
-    severity: Option<GcpSeverity>,
+    severity: Option<Severity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<Box<str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,46 +226,56 @@ fn duration_serializer<S: Serializer>(dur: &Option<Duration>, ser: S) -> Result<
 
 #[derive(Serialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct HttpRequestInfo {
+struct HttpRequestInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_method: Option<Box<str>>,
+    request_method: Option<Box<str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_url: Option<Box<str>>,
+    request_url: Option<Box<str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_size: Option<u64>,
+    request_size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<u16>,
+    status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_size: Option<u64>,
+    response_size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub user_agent: Option<Box<str>>,
+    user_agent: Option<Box<str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub remote_ip: Option<Box<str>>,
+    remote_ip: Option<Box<str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub server_ip: Option<Box<str>>,
+    server_ip: Option<Box<str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub referer: Option<Box<str>>,
+    referer: Option<Box<str>>,
     #[serde(skip_serializing_if = "Option::is_none", serialize_with = "duration_serializer")]
-    pub latency: Option<Duration>,
+    latency: Option<Duration>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_lookup: Option<bool>,
+    cache_lookup: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_hit: Option<bool>,
+    cache_hit: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_validated_with_origin_server: Option<bool>,
+    cache_validated_with_origin_server: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_fill_bytes: Option<u64>,
+    cache_fill_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<Box<str>>,
+    protocol: Option<Box<str>>,
 }
 
-#[derive(Serialize, Default, Clone)]
+#[derive(Deserialize, Serialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct OperationInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<Box<str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub producer: Option<Box<str>>,
+}
+
+impl OperationInfo {
+    pub fn new(id: impl AsRef<str>, producer: Option<impl AsRef<str>>) -> Self {
+        let mut v = Self::default();
+        v.id = Some(id.as_ref().into());
+        v.producer = producer.map(|v| v.as_ref().into());
+        v
+    }
 }
 
 #[derive(Serialize, Default)]
@@ -213,27 +317,18 @@ impl OperationData {
     }
 }
 
-pub struct GcpLayer<W: std::io::Write> {
-    writer: W,
+pub struct Layer<W: std::io::Write> {
+    writer: Mutex<W>,
+    #[cfg_attr(not(feature = "opentelemetry"), allow(unused))]
     project_id: Box<str>,
     operations: Mutex<HashMap<Id, Arc<Mutex<OperationData>>>>,
     expositions: RwLock<HashMap<Id, Arc<SpanExposition>>>
 }
 
-trait LayerAccess: Any {
-    fn operations(&self) -> &Mutex<HashMap<Id, Arc<Mutex<OperationData>>>>;
-}
-
-impl<W: std::io::Write + 'static> LayerAccess for GcpLayer<W> {
-    fn operations(&self) -> &Mutex<HashMap<Id, Arc<Mutex<OperationData>>>> {
-        &self.operations
-    }
-}
-
-impl<W: std::io::Write> GcpLayer<W> {
-    pub fn new(writer: W, project_id: impl AsRef<str>) -> Self {
+impl<W: std::io::Write> Layer<W> {
+    fn new(writer: W, project_id: impl AsRef<str>) -> Self {
         Self {
-            writer,
+            writer: writer.into(),
             project_id: project_id.as_ref().into(),
             operations: HashMap::new().into(),
             expositions: HashMap::new().into()
@@ -241,8 +336,8 @@ impl<W: std::io::Write> GcpLayer<W> {
     }
 }
 
-impl<W: std::io::Write + 'static, S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for GcpLayer<W> {
-    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+impl<W: std::io::Write + 'static, S: Subscriber + for<'a> LookupSpan<'a>> TracingLayer<S> for Layer<W> {
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, #[allow(unused)] ctx: Context<'_, S>) {
         if let Some(mut expositions) = self.expositions.write().ok() {
             let span_id = format!("{:016x}", id.into_u64());
 
@@ -252,6 +347,7 @@ impl<W: std::io::Write + 'static, S: Subscriber + for<'a> LookupSpan<'a>> Layer<
                 fields: HashMap::new()
             };
 
+            #[cfg(feature = "opentelemetry")]
             self.try_find_trace_id(id, ctx, &mut exposition);
             attrs.record(&mut exposition.visit());
 
@@ -259,12 +355,13 @@ impl<W: std::io::Write + 'static, S: Subscriber + for<'a> LookupSpan<'a>> Layer<
         }
     }
 
-    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+    fn on_record(&self, id: &Id, values: &Record<'_>, #[allow(unused)] ctx: Context<'_, S>) {
         if let Some(mut expositions) = self.expositions.write().ok() {
             let arc = expositions.get_mut(id).unwrap();
             let mut exposition = (**arc).clone();
 
             if exposition.trace_id.is_none() {
+                #[cfg(feature = "opentelemetry")]
                 self.try_find_trace_id(id, ctx, &mut exposition);
             }
 
@@ -274,12 +371,12 @@ impl<W: std::io::Write + 'static, S: Subscriber + for<'a> LookupSpan<'a>> Layer<
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        let mut log = GcpStructuredLog {
+        let mut log = LogEntry {
             severity: match *event.metadata().level() {
-                Level::TRACE | Level::DEBUG => Some(GcpSeverity::Debug),
-                Level::INFO => Some(GcpSeverity::Info),
-                Level::WARN => Some(GcpSeverity::Warning),
-                Level::ERROR => Some(GcpSeverity::Error),
+                Level::TRACE | Level::DEBUG => Some(Severity::Debug),
+                Level::INFO => Some(Severity::Info),
+                Level::WARN => Some(Severity::Warning),
+                Level::ERROR => Some(Severity::Error),
             },
             time: Some(Utc::now()),
             source_location: Some(SourceLocation {
@@ -287,7 +384,7 @@ impl<W: std::io::Write + 'static, S: Subscriber + for<'a> LookupSpan<'a>> Layer<
                 line: event.metadata().line().map(|v| v as u64),
                 function: None
             }),
-            ..GcpStructuredLog::default()
+            ..LogEntry::default()
         };
 
         let mut span_ref = ctx.event_span(event);
@@ -325,16 +422,15 @@ impl<W: std::io::Write + 'static, S: Subscriber + for<'a> LookupSpan<'a>> Layer<
             }
 
             let span_id = format!("{:016x}", span.id().into_u64());
-            let mut trace_id = None::<String>;
             if log.span_id.is_none() {
                 log.span_id = Some(span_id.clone().into())
             }
 
+            #[cfg(feature = "opentelemetry")]
             if let Some(otel) = span.extensions().get::<OtelData>() {
                 if let Some(trace) = otel.trace_id() {
-                    trace_id = Some(format!("projects/{}/traces/{:032x}", self.project_id, trace));
                     if log.trace.is_none() && trace != TraceId::INVALID {
-                        log.trace = Some(trace_id.clone().unwrap().into());
+                        log.trace = Some(format!("projects/{}/traces/{:032x}", self.project_id, trace).into());
                     }
                 }
             }
@@ -350,6 +446,7 @@ impl<W: std::io::Write + 'static, S: Subscriber + for<'a> LookupSpan<'a>> Layer<
                     if let Some(serde_json::Value::String(s)) = exposition.fields.get("function") {
                         if let Some(src) = log.source_location.as_mut() && src.function.is_none() {
                             src.function = Some(s.as_str().into());
+                            looking_for_function = false;
                         }
                     }
                 }
@@ -362,7 +459,7 @@ impl<W: std::io::Write + 'static, S: Subscriber + for<'a> LookupSpan<'a>> Layer<
 
         event.record(&mut log);
 
-        println!("{}", serde_json::to_string(&log).unwrap());
+        let _ = writeln!(self.writer.lock().unwrap(), "{}", serde_json::to_string(&log).unwrap());
     }
 
     fn on_close(&self, id: Id, _ctx: Context<'_, S>) {
@@ -395,7 +492,8 @@ impl<W: std::io::Write + 'static, S: Subscriber + for<'a> LookupSpan<'a>> Layer<
     }
 }
 
-impl<W: std::io::Write> GcpLayer<W> {
+#[cfg(feature = "opentelemetry")]
+impl<W: std::io::Write> Layer<W> {
     fn try_find_trace_id<S: Subscriber + for<'a> LookupSpan<'a>>(&self, id: &Id, ctx: Context<'_, S>, exposition: &mut SpanExposition) {
         if let Some(span) = ctx.span(id) {
             if let Some(otel) = span.extensions().get::<OtelData>() {
@@ -411,7 +509,7 @@ static B64: LazyLock<base64::engine::GeneralPurpose> = LazyLock::new(|| {
     base64::engine::GeneralPurpose::new(&base64::alphabet::STANDARD, Default::default())
 });
 
-impl<'a> GcpStructuredLog<'a> {
+impl<'a> LogEntry<'a> {
     fn record(&mut self, field: &Field, value: impl Into<serde_json::Value>) {
         if field.name().starts_with("labels.") {
             self.labels.get_or_insert(HashMap::new()).insert(
@@ -424,7 +522,7 @@ impl<'a> GcpStructuredLog<'a> {
     }
 }
 
-impl<'a> field::Visit for GcpStructuredLog<'a> {
+impl<'a> field::Visit for LogEntry<'a> {
     fn record_f64(&mut self, field: &Field, value: f64) {
         self.record(field, value);
     }
@@ -559,10 +657,22 @@ impl<T: Exposition + ?Sized> field::Visit for Visit<'_, T> {
     }
 }
 
+/// Represents a potentially long-running operation that can be used by
+/// Google Cloud to group log entries.
+///
+/// Created automatically by [SpanExt::operation].
 pub struct Operation(Option<Arc<Mutex<OperationData>>>);
 
 impl Operation {
-    pub fn update(&self, info: OperationInfo) -> &Self {
+    /// Updates the details within this operation. You should really only call
+    /// this once.
+    ///
+    /// After initializing, the first event will have the operation attached
+    /// with the `first` attribute set to `true`. Subsequent events will not
+    /// have this attribute.
+    ///
+    /// To indicate that you are done operating, see [Operation::end].
+    pub fn init(&self, info: OperationInfo) -> &Self {
         if let Some(mut data) = self.0.as_ref().and_then(|v| v.lock().ok()) {
             data.info = info;
         }
@@ -570,6 +680,35 @@ impl Operation {
         self
     }
 
+    /// Imports operation info that has already been started. The only
+    /// difference between this method and [Operation::init] is the first event
+    /// will _not_ have a `first` attribute.
+    pub fn import(&self, info: OperationInfo) -> &Self {
+        if let Some(mut data) = self.0.as_ref().and_then(|v| v.lock().ok()) {
+            data.info = info;
+            data.first = false;
+        }
+
+        self
+    }
+
+    /// Returns a copy of this operations info that can be passed to other
+    /// programs. [OperationInfo] implements [Serialize] and [Deserialize] to
+    /// allow passing them safely.
+    pub fn export(&self) -> OperationInfo {
+        if let Some(data) = self.0.as_ref().and_then(|v| v.lock().ok()) {
+            data.info.clone()
+        } else {
+            OperationInfo::default()
+        }
+    }
+
+    /// Marks this operation as finished. **You must send an event after calling
+    /// this if you really mean it.**
+    ///
+    /// The next event after calling this method will have the `last` attribute
+    /// set to `true`, indicating that the event is the final in the chain
+    /// making up the operation.
     pub fn end(self) {
         if let Some(mut data) = self.0.as_ref().and_then(|v| v.lock().ok()) {
             data.last = true;
@@ -578,6 +717,12 @@ impl Operation {
 }
 
 pub trait SpanExt {
+    /// Retrieves an [Operation] associated with this [Span][tracing::Span].
+    /// If one does not already exist, it will be created automatically.
+    ///
+    /// This method is safe to call when this crate's [Layer] is not available,
+    /// e.g. in a development environment. In this case, the returned
+    /// [Operation] will not perform any actions.
     fn operation(&'_ self) -> Operation;
 }
 
@@ -599,6 +744,16 @@ pub struct LayerBuilder<ProjectId = (), W: std::io::Write = std::io::Stdout> {
 }
 
 impl<W: std::io::Write> LayerBuilder<(), W> {
+    /// Sets the project's ID for use by the [Layer]. This is mainly useful for
+    /// including trace IDs, where, depending on the writer you're using,
+    /// Google Cloud may not be able to infer the correct project ID. To
+    /// (hopefully) get around this if it is ever a problem, this crate always
+    /// writes traces in the full format, `projects/<...>/traces/<...>`.
+    ///
+    /// As such, the project ID is required.
+    ///
+    /// If the `opentelemetry` feature is disabled, it is allowed to construct
+    /// the layer without calling this function.
     pub fn with_project_id<T: AsRef<str>>(self, text: T) -> LayerBuilder<T, W> {
         LayerBuilder {
             project_id: text,
@@ -608,6 +763,8 @@ impl<W: std::io::Write> LayerBuilder<(), W> {
 }
 
 impl<ProjectId, W: std::io::Write> LayerBuilder<ProjectId, W> {
+    /// Sets the writer which logs will be written to.
+    /// The default is [std::io::stdout()].
     pub fn with_writer<N: std::io::Write>(self, writer: N) -> LayerBuilder<ProjectId, N> {
         LayerBuilder {
             project_id: self.project_id,
@@ -616,9 +773,28 @@ impl<ProjectId, W: std::io::Write> LayerBuilder<ProjectId, W> {
     }
 }
 
-impl<ProjectId: AsRef<str>, W: std::io::Write> LayerBuilder<ProjectId, W> {
-    pub fn build(self) -> GcpLayer<W> {
-        GcpLayer::new(self.writer, self.project_id)
+trait ProjectIdTrait {
+    fn string(&self) -> &str;
+}
+
+#[cfg(not(feature = "opentelemetry"))]
+impl<T> ProjectIdTrait for T {
+    fn string(&self) -> &str {
+        ""
+    }
+}
+
+#[cfg(feature = "opentelemetry")]
+impl<T: AsRef<str>> ProjectIdTrait for T {
+    fn string(&self) -> &str {
+        self.as_ref()
+    }
+}
+
+#[allow(private_bounds)]
+impl<ProjectId: ProjectIdTrait, W: std::io::Write> LayerBuilder<ProjectId, W> {
+    pub fn build(self) -> Layer<W> {
+        Layer::new(self.writer, self.project_id.string())
     }
 }
 
